@@ -235,14 +235,18 @@ export default function TVNativeVideo({
 
     attach();
 
-    let seekedInitialTime = false;
+    let triedInitialSeek = false;
     const seekToInitialTime = () => {
-      if (live || seekedInitialTime || !startTime || startTime <= 1) return;
+      if (live || triedInitialSeek || !startTime || startTime <= 1) return;
+      if ((videoEl.currentTime || 0) > 1) {
+        triedInitialSeek = true;
+        return;
+      }
       const duration = videoEl.duration || 0;
       const safeTime = duration > 30 ? Math.min(startTime, Math.max(0, duration - 8)) : startTime;
       try {
         videoEl.currentTime = safeTime;
-        seekedInitialTime = true;
+        triedInitialSeek = true;
       } catch {
         // ignore unsupported seek state
       }
@@ -289,7 +293,7 @@ export default function TVNativeVideo({
     videoEl.addEventListener('waiting', onBuffering);
     videoEl.addEventListener('stalled', onBuffering);
     videoEl.addEventListener('seeking', onBuffering);
-    videoEl.addEventListener('seeked', onLoaded);
+    videoEl.addEventListener('seeked', clearBuffering);
     videoEl.addEventListener('error', onError);
     videoEl.addEventListener('timeupdate', onTimeUpdate);
 
@@ -305,7 +309,7 @@ export default function TVNativeVideo({
       videoEl.removeEventListener('waiting', onBuffering);
       videoEl.removeEventListener('stalled', onBuffering);
       videoEl.removeEventListener('seeking', onBuffering);
-      videoEl.removeEventListener('seeked', onLoaded);
+      videoEl.removeEventListener('seeked', clearBuffering);
       videoEl.removeEventListener('error', onError);
       videoEl.removeEventListener('timeupdate', onTimeUpdate);
       clearBuffering();

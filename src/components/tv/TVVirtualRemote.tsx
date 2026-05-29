@@ -30,8 +30,17 @@ function isVisible(element: HTMLElement) {
 }
 
 function getFocusableElements() {
+  const scope = document.querySelector<HTMLElement>('[data-tv-focus-scope="active"]');
+  if (scope) {
+    return Array.from(scope.querySelectorAll<HTMLElement>(focusableSelector))
+      .filter((element) => !element.closest('[data-tv-remote]'))
+      .filter((element) => !element.closest('[data-tv-no-focus="true"]'))
+      .filter(isVisible);
+  }
+
   return Array.from(document.querySelectorAll<HTMLElement>(focusableSelector))
     .filter((element) => !element.closest('[data-tv-remote]'))
+    .filter((element) => !element.closest('[data-tv-no-focus="true"]'))
     .filter(isVisible);
 }
 
@@ -232,6 +241,25 @@ export default function TVVirtualRemote() {
       if (event.defaultPrevented) return;
 
       if (event.key === 'ArrowUp' || event.key === 'ArrowDown' || event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        const active = document.activeElement;
+        if (active instanceof HTMLElement && active.closest('[data-tv-danmaku-settings]')) {
+          return;
+        }
+
+        if (
+          active instanceof HTMLInputElement &&
+          active.type === 'range' &&
+          active.closest('[data-tv-danmaku-settings]')
+        ) {
+          if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            return;
+          }
+        }
+
+        if (active instanceof HTMLInputElement && active.type === 'range' && active.closest('[data-tv-no-focus="true"]')) {
+          return;
+        }
+
         event.preventDefault();
         const direction = event.key.replace('Arrow', '').toLowerCase() as 'up' | 'down' | 'left' | 'right';
         moveSpatialFocus(direction, lastFocusedRef.current);
@@ -239,6 +267,11 @@ export default function TVVirtualRemote() {
       }
 
       if (event.key === 'Enter') {
+        const playerRoot = document.querySelector<HTMLElement>('[data-tv-player-root]');
+        if (playerRoot?.dataset.tvControlsOpen === 'false') {
+          return;
+        }
+
         const active = document.activeElement;
         if (active instanceof HTMLElement && !active.closest('input, textarea, select') && !active.closest('[data-tv-remote]')) {
           event.preventDefault();

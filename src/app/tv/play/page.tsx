@@ -1,12 +1,12 @@
 'use client';
 
-import { AlertTriangle, ArrowLeft, Heart, Info, Layers, ListVideo, Loader2, Maximize, MessageCircle, Pause, Play, RotateCcw, ShieldOff, SkipBack, SkipForward, X, Volume2, VolumeX } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Heart, Info, Layers, ListVideo, Loader2, Maximize, MessageCircle, Pause, Play, RotateCcw, ShieldOff, SkipBack, SkipForward, SlidersHorizontal, X, Volume2, VolumeX } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, type Dispatch, type FocusEvent, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { deleteFavorite, generateStorageKey, getAllPlayRecords, getSkipConfig, isFavorited, saveFavorite, savePlayRecord } from '@/lib/db.client';
+import { deleteFavorite, deletePlayRecord, generateStorageKey, getAllPlayRecords, getSkipConfig, isFavorited, saveFavorite, savePlayRecord } from '@/lib/db.client';
 import { SearchResult } from '@/lib/types';
-import { convertDanmakuFormat, getDanmakuById, getEpisodes, initDanmakuModule, searchAnime } from '@/lib/danmaku/api';
+import { convertDanmakuFormat, getDanmakuById, getEpisodes, initDanmakuModule, loadDanmakuDisplayState, saveDanmakuDisplayState, searchAnime } from '@/lib/danmaku/api';
 
 import TVNativeVideo from '@/components/tv/player/TVNativeVideo';
 import { fetchTVDetail, formatTVTime, resolveTVEpisodeUrl } from '@/components/tv/player/utils';
@@ -14,9 +14,112 @@ import TVVirtualRemote from '@/components/tv/TVVirtualRemote';
 
 const TV_DANMAKU_LANES = 8;
 const TV_DANMAKU_SPAWN_GRACE = 0.6;
+const TV_DANMAKU_SEEK_WINDOW = 8;
+const TV_DANMAKU_MAX_ITEMS = 3000;
+const TV_DANMAKU_SETTINGS_KEY = 'tv_danmaku_settings';
+
+type TVDanmakuSettings = {
+  fontSize: number;
+  displayArea: number;
+  opacity: number;
+};
+
+const DEFAULT_TV_DANMAKU_SETTINGS: TVDanmakuSettings = {
+  fontSize: 30,
+  displayArea: 42,
+  opacity: 0.75,
+};
+
+function loadTVDanmakuSettings(): TVDanmakuSettings {
+  if (typeof window === 'undefined') return DEFAULT_TV_DANMAKU_SETTINGS;
+
+  try {
+    const saved = localStorage.getItem(TV_DANMAKU_SETTINGS_KEY);
+    if (!saved) return DEFAULT_TV_DANMAKU_SETTINGS;
+    const parsed = JSON.parse(saved) as Partial<TVDanmakuSettings>;
+    return {
+      fontSize: typeof parsed.fontSize === 'number' ? parsed.fontSize : DEFAULT_TV_DANMAKU_SETTINGS.fontSize,
+      displayArea: typeof parsed.displayArea === 'number' ? parsed.displayArea : DEFAULT_TV_DANMAKU_SETTINGS.displayArea,
+      opacity: typeof parsed.opacity === 'number' ? parsed.opacity : DEFAULT_TV_DANMAKU_SETTINGS.opacity,
+    };
+  } catch {
+    return DEFAULT_TV_DANMAKU_SETTINGS;
+  }
+}
 
 function getTVDanmakuDuration(text: string) {
   return Math.max(6, 12 - Math.min(6, text.length / 6));
+}
+
+function blurTVPlayerControl() {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement && active.closest('[data-tv-player-control]')) {
+    active.blur();
+  }
+}
+
+function scrollFocusedControlIntoView(event: FocusEvent<HTMLElement>) {
+  const target = event.target;
+  if (target instanceof HTMLElement) {
+    target.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' });
+  }
+}
+
+function updateTVDanmakuSetting(
+  field: keyof TVDanmakuSettings,
+  direction: -1 | 1,
+  setDanmakuSettings: Dispatch<SetStateAction<TVDanmakuSettings>>
+) {
+  setDanmakuSettings((prev) => {
+    if (field === 'opacity') {
+      const next = Math.max(0.25, Math.min(1, prev.opacity + direction * 0.05));
+      return { ...prev, opacity: Math.round(next * 100) / 100 };
+    }
+
+    if (field === 'displayArea') {
+      const next = Math.max(24, Math.min(72, prev.displayArea + direction * 2));
+      return { ...prev, displayArea: next };
+    }
+
+    const next = Math.max(20, Math.min(46, prev.fontSize + direction * 1));
+    return { ...prev, fontSize: next };
+  });
+}
+
+function getDanmakuSettingField(target: HTMLElement | null): keyof TVDanmakuSettings | null {
+  if (!(target instanceof HTMLInputElement) || target.type !== 'range') return null;
+  const field = target.dataset.tvDanmakuField;
+  if (field === 'fontSize' || field === 'displayArea' || field === 'opacity') return field;
+  return null;
+}
+
+function getFocusableElementsInScope(scope: HTMLElement) {
+  return Array.from(
+    scope.querySelectorAll<HTMLElement>([
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(','))
+  ).filter((element) => !element.closest('[data-tv-no-focus="true"]'));
+}
+
+function moveFocusWithinScope(scope: HTMLElement, direction: 'up' | 'down') {
+  const elements = getFocusableElementsInScope(scope);
+  if (elements.length === 0) return;
+
+  const active = document.activeElement;
+  const index = active instanceof HTMLElement ? elements.indexOf(active) : -1;
+  if (index === -1) {
+    elements[0].focus({ preventScroll: true });
+    return;
+  }
+
+  const nextIndex = direction === 'down'
+    ? Math.min(elements.length - 1, index + 1)
+    : Math.max(0, index - 1);
+  elements[nextIndex]?.focus({ preventScroll: true });
 }
 
 function TVPlayClient() {
@@ -32,6 +135,7 @@ function TVPlayClient() {
   const [showPanel, setShowPanel] = useState(true);
   const [showEpisodes, setShowEpisodes] = useState(false);
   const [showDetail, setShowDetail] = useState(false);
+  const [showDanmakuSettings, setShowDanmakuSettings] = useState(false);
   const [toggleCommand, setToggleCommand] = useState(0);
   const [retryNonce, setRetryNonce] = useState(0);
   const [startTime, setStartTime] = useState(0);
@@ -52,10 +156,13 @@ function TVPlayClient() {
   });
   const [danmakuEnabled, setDanmakuEnabled] = useState(() => {
     if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('tv_danmaku_enabled');
-    return saved === null ? true : saved === 'true';
+    const saved = loadDanmakuDisplayState();
+    if (saved !== null) return saved;
+    const legacySaved = localStorage.getItem('tv_danmaku_enabled');
+    return legacySaved === null ? true : legacySaved === 'true';
   });
   const [danmakuItems, setDanmakuItems] = useState<Array<{ text: string; time: number; color: string; mode: number }>>([]);
+  const [danmakuSettings, setDanmakuSettings] = useState<TVDanmakuSettings>(() => loadTVDanmakuSettings());
   const [activeDanmakuItems, setActiveDanmakuItems] = useState<Array<{
     id: string;
     text: string;
@@ -73,12 +180,14 @@ function TVPlayClient() {
   const timeRef = useRef({ current: 0, duration: 0 });
   const episodeButtonRefs = useRef<Record<number, HTMLButtonElement | null>>({});
   const detailCloseButtonRef = useRef<HTMLButtonElement | null>(null);
+  const danmakuFontSizeInputRef = useRef<HTMLInputElement | null>(null);
   const digitTimerRef = useRef<number | null>(null);
   const idleTimerRef = useRef<number | null>(null);
   const volumeHintTimerRef = useRef<number | null>(null);
   const seekHintTimerRef = useRef<number | null>(null);
   const spawnedDanmakuRef = useRef<Set<string>>(new Set());
   const lastDanmakuTimeRef = useRef(0);
+  const suppressPlayRecordSaveKeyRef = useRef<string | null>(null);
   const skippedIntroRef = useRef('');
   const skippedOutroRef = useRef('');
   const lastSavedRef = useRef<{
@@ -160,8 +269,15 @@ function TVPlayClient() {
   }, [adFilterEnabled]);
 
   useEffect(() => {
-    if (typeof window !== 'undefined') localStorage.setItem('tv_danmaku_enabled', String(danmakuEnabled));
+    if (typeof window === 'undefined') return;
+    saveDanmakuDisplayState(danmakuEnabled);
+    localStorage.setItem('tv_danmaku_enabled', String(danmakuEnabled));
   }, [danmakuEnabled]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    localStorage.setItem(TV_DANMAKU_SETTINGS_KEY, JSON.stringify(danmakuSettings));
+  }, [danmakuSettings]);
 
   useEffect(() => {
     if (typeof window !== 'undefined') localStorage.setItem('tv_playback_rate', String(playbackRate));
@@ -189,7 +305,8 @@ function TVPlayClient() {
           searchKeyword: title || detail.title,
         });
         if (!alive) return;
-        setDanmakuItems(convertDanmakuFormat(comments).slice(0, 250));
+        lastDanmakuTimeRef.current = Math.max(0, timeRef.current.current - TV_DANMAKU_SEEK_WINDOW - 1);
+        setDanmakuItems(convertDanmakuFormat(comments).slice(0, TV_DANMAKU_MAX_ITEMS));
       } catch {
         if (alive) setDanmakuItems([]);
       }
@@ -209,9 +326,10 @@ function TVPlayClient() {
     const current = time.current;
     const previous = lastDanmakuTimeRef.current;
     const jumped = current < previous - 1 || current - previous > 2;
-    const spawnWindow = jumped ? TV_DANMAKU_SPAWN_GRACE : Math.max(TV_DANMAKU_SPAWN_GRACE, current - previous + 0.2);
+    const spawnWindow = jumped ? TV_DANMAKU_SEEK_WINDOW : Math.max(TV_DANMAKU_SPAWN_GRACE, current - previous + 0.2);
 
     const spawned = spawnedDanmakuRef.current;
+    if (jumped) spawned.clear();
     const nextItems = danmakuItems
       .map((item, index) => {
         const id = `${index}-${item.time}-${item.text}`;
@@ -225,8 +343,8 @@ function TVPlayClient() {
         };
       })
       .filter((item) => {
-        const lateBy = current - item.time;
-        return lateBy >= 0 && lateBy <= spawnWindow && !spawned.has(item.id);
+        const delta = jumped ? Math.abs(item.time - current) : current - item.time;
+        return delta >= 0 && delta <= spawnWindow && !spawned.has(item.id);
       })
       .slice(0, TV_DANMAKU_LANES);
 
@@ -285,6 +403,9 @@ function TVPlayClient() {
   useEffect(() => {
     if (!detail) return;
     const saveProgress = () => {
+      const storageKey = generateStorageKey(detail.source, detail.id);
+      if (suppressPlayRecordSaveKeyRef.current === storageKey) return;
+
       const playTime = Math.floor(timeRef.current.current || 0);
       const totalTime = Math.floor(timeRef.current.duration || 0);
 
@@ -392,6 +513,8 @@ function TVPlayClient() {
     idleTimerRef.current = window.setTimeout(() => {
       setShowPanel(false);
       setShowEpisodes(false);
+      setShowDanmakuSettings(false);
+      blurTVPlayerControl();
     }, 10000);
   }, []);
 
@@ -432,18 +555,24 @@ function TVPlayClient() {
   }, [muted, videoUrl, volume]);
 
   useEffect(() => {
-    if (showPanel || showEpisodes) revealPanel();
+    if (showPanel || showEpisodes || showDanmakuSettings) revealPanel();
     return () => {
       if (idleTimerRef.current) window.clearTimeout(idleTimerRef.current);
     };
-  }, [revealPanel, showEpisodes, showPanel]);
+  }, [revealPanel, showDanmakuSettings, showEpisodes, showPanel]);
 
   const switchSource = async (item: SearchResult) => {
+    if (!detail) return;
+    if (detail.source === item.source && detail.id === item.id) return;
     revealPanel();
     setShowEpisodes(false);
     setLoading(true);
     setIsBuffering(false);
     const currentPlayTime = Math.floor(timeRef.current.current || 0);
+    const oldSource = detail.source;
+    const oldId = detail.id;
+    const oldStorageKey = generateStorageKey(oldSource, oldId);
+    suppressPlayRecordSaveKeyRef.current = oldStorageKey;
     try {
       let next = item;
       if (!item.episodes?.length) {
@@ -455,7 +584,11 @@ function TVPlayClient() {
       setEpisodeIndex(targetIndex);
       setStartTime(currentPlayTime > 1 ? currentPlayTime : 0);
       setEpisodePage(Math.floor(targetIndex / 30));
+      if (!(next.source === oldSource && next.id === oldId)) {
+        await deletePlayRecord(oldSource, oldId);
+      }
     } catch (err) {
+      suppressPlayRecordSaveKeyRef.current = null;
       setError(err instanceof Error ? err.message : '切换播放源失败');
     } finally {
       setLoading(false);
@@ -469,6 +602,12 @@ function TVPlayClient() {
   }, [showDetail]);
 
   useEffect(() => {
+    if (showDanmakuSettings) {
+      window.requestAnimationFrame(() => danmakuFontSizeInputRef.current?.focus({ preventScroll: true }));
+    }
+  }, [showDanmakuSettings]);
+
+  useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (showDetail && event.key === 'Escape') {
         event.preventDefault();
@@ -477,12 +616,22 @@ function TVPlayClient() {
         return;
       }
 
+      if (showDanmakuSettings && event.key === 'Escape') {
+        event.preventDefault();
+        setShowDanmakuSettings(false);
+        blurTVPlayerControl();
+        revealPanel();
+        return;
+      }
+
       const isMenuKey = event.key === 'ContextMenu' || event.key === 'Menu' || event.keyCode === 93;
       if (isMenuKey) {
         event.preventDefault();
-        if (showPanel || showEpisodes) {
+        if (showPanel || showEpisodes || showDanmakuSettings) {
           setShowPanel(false);
           setShowEpisodes(false);
+          setShowDanmakuSettings(false);
+          blurTVPlayerControl();
         } else {
           revealPanel();
         }
@@ -505,13 +654,18 @@ function TVPlayClient() {
         const isControlFocused = active instanceof HTMLElement && Boolean(active.closest('[data-tv-player-control]'));
         if (!showPanel && !showEpisodes) {
           event.preventDefault();
+          event.stopImmediatePropagation();
+          blurTVPlayerControl();
           setToggleCommand((value) => value + 1);
           return;
         }
         if (!isControlFocused) {
           event.preventDefault();
-          if (showPanel || showEpisodes) revealPanel();
+          event.stopImmediatePropagation();
+          setToggleCommand((value) => value + 1);
+          return;
         }
+        return;
       }
 
       if (!showPanel && !showEpisodes && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
@@ -533,8 +687,16 @@ function TVPlayClient() {
       if (event.key === 'Escape') {
         event.preventDefault();
         if (showDetail) setShowDetail(false);
-        else if (showEpisodes) setShowEpisodes(false);
-        else if (showPanel) setShowPanel(false);
+        else if (showDanmakuSettings) {
+          setShowDanmakuSettings(false);
+          blurTVPlayerControl();
+        } else if (showEpisodes) {
+          setShowEpisodes(false);
+          blurTVPlayerControl();
+        } else if (showPanel) {
+          setShowPanel(false);
+          blurTVPlayerControl();
+        }
         else router.back();
       }
       if (event.key === 'PageUp') switchEpisode(episodeIndex - 1);
@@ -542,7 +704,7 @@ function TVPlayClient() {
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [detail?.episodes?.length, digitBuffer, episodeIndex, revealPanel, router, showDetail, showEpisodes, showPanel, volume]);
+  }, [detail?.episodes?.length, digitBuffer, episodeIndex, revealPanel, router, showDanmakuSettings, showDetail, showEpisodes, showPanel, volume]);
 
   useEffect(() => {
     if (!showEpisodes) return;
@@ -591,12 +753,15 @@ function TVPlayClient() {
   }
 
   return (
-    <main data-tv-player-root className='fixed inset-0 overflow-hidden bg-black text-white'>
+    <main data-tv-player-root data-tv-controls-open={showPanel || showEpisodes || showDetail || showDanmakuSettings ? 'true' : 'false'} className='fixed inset-0 overflow-hidden bg-black text-white'>
       {videoUrl ? <TVNativeVideo key={`${videoUrl}-${retryNonce}`} url={videoUrl} poster={detail.poster} title={detail.title} onTime={onTime} command={toggleCommand} startTime={startTime} onError={() => setPlaybackError(true)} onPlayingChange={setIsPlaying} onBufferingChange={setIsBuffering} adFilterEnabled={adFilterEnabled} playbackRate={playbackRate} /> : (
         <div className='flex h-full w-full items-center justify-center text-3xl font-bold text-white'><Loader2 className='mr-4 h-10 w-10 animate-spin text-rose-500' />{resolving ? '正在解析播放地址...' : '准备播放...'}</div>
       )}
       {activeDanmakuItems.length > 0 && (
-        <div className='pointer-events-none absolute inset-x-0 top-12 z-10 h-[42vh] overflow-hidden'>
+        <div
+          className='pointer-events-none absolute inset-x-0 top-12 z-10 overflow-hidden'
+          style={{ height: `${danmakuSettings.displayArea}vh` }}
+        >
           {activeDanmakuItems.map((item) => (
             <div
               key={item.id}
@@ -607,6 +772,8 @@ function TVPlayClient() {
               style={{
                 top: `${item.lane * 12}%`,
                 color: item.color || '#fff',
+                fontSize: `${danmakuSettings.fontSize}px`,
+                opacity: danmakuSettings.opacity,
                 animation: `tv-danmaku ${item.duration}s linear forwards`,
                 animationPlayState: isPlaying && !isBuffering ? 'running' : 'paused',
               }}
@@ -651,8 +818,8 @@ function TVPlayClient() {
       </div>
 
       <div data-tv-player-control className={`absolute bottom-8 left-8 right-8 transition-opacity duration-300 ${showPanel ? 'opacity-100' : 'pointer-events-none opacity-0'}`}>
-        <div className='flex items-center justify-between gap-5 rounded-[28px] bg-black/75 p-4 backdrop-blur'>
-          <div className='flex items-center gap-3'>
+        <div className='rounded-[28px] bg-black/75 p-4 backdrop-blur'>
+          <div onFocusCapture={scrollFocusedControlIntoView} className='flex items-center gap-3 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden [&_button]:shrink-0 [&_button]:whitespace-nowrap'>
             <button onClick={() => switchEpisode(episodeIndex - 1)} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'><SkipBack className='h-6 w-6' />上一集</button>
             <button onClick={() => setToggleCommand((value) => value + 1)} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-rose-600 px-6 py-4 text-xl font-black outline-none'>
               {isPlaying ? <Pause className='h-6 w-6' /> : <Play className='h-6 w-6 fill-current' />}
@@ -660,21 +827,19 @@ function TVPlayClient() {
             </button>
             <button onClick={() => switchEpisode(episodeIndex + 1)} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'>下一集<SkipForward className='h-6 w-6' /></button>
             <button onClick={() => setShowEpisodes((v) => !v)} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'><ListVideo className='h-6 w-6' />选集</button>
-            <button onClick={() => { setShowEpisodes(true); revealPanel(); }} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'><Layers className='h-6 w-6' />换源</button>
             <button onClick={toggleFavorite} data-tv-player-control className={`tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl px-5 py-4 text-xl font-bold outline-none ${favorited ? 'bg-rose-600' : 'bg-white/10'}`}><Heart className={`h-6 w-6 ${favorited ? 'fill-current' : ''}`} />收藏</button>
             <button onClick={() => { setShowDetail(true); revealPanel(); }} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'><Info className='h-6 w-6' />详情</button>
             <button onClick={() => setDanmakuEnabled((v) => !v)} data-tv-player-control className={`tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl px-5 py-4 text-xl font-bold outline-none ${danmakuEnabled ? 'bg-rose-600' : 'bg-white/10'}`}><MessageCircle className='h-6 w-6' />弹幕</button>
+            <button onClick={() => { setShowEpisodes(false); setShowDanmakuSettings(true); revealPanel(); }} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'><SlidersHorizontal className='h-6 w-6' />弹幕设置</button>
             <button onClick={() => setAdFilterEnabled((v) => !v)} data-tv-player-control className={`tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl px-5 py-4 text-xl font-bold outline-none ${adFilterEnabled ? 'bg-rose-600' : 'bg-white/10'}`}><ShieldOff className='h-6 w-6' />去广告</button>
             <button onClick={cyclePlaybackRate} data-tv-player-control className='tv-focusable flex cursor-pointer items-center gap-2 rounded-2xl bg-white/10 px-5 py-4 text-xl font-bold outline-none'>{playbackRate}x</button>
-          </div>
-          <div className='flex items-center gap-3 text-xl font-bold text-slate-200'>
             <button onClick={toggleMute} data-tv-player-control className='tv-focusable rounded-2xl bg-white/10 p-4 outline-none' title='静音'>{muted ? <VolumeX className='h-6 w-6' /> : <Volume2 className='h-6 w-6' />}</button>
             <button onClick={toggleFullscreen} data-tv-player-control className='tv-focusable rounded-2xl bg-white/10 p-4 outline-none'><Maximize className='h-6 w-6' /></button>
-            <span>{formatTVTime(time.current)} / {formatTVTime(time.duration)}</span>
+            <span className='shrink-0 whitespace-nowrap px-2 text-xl font-bold text-slate-200'>{formatTVTime(time.current)} / {formatTVTime(time.duration)}</span>
           </div>
         </div>
         <div className='mt-4 rounded-3xl bg-black/70 p-4 backdrop-blur'>
-          <input aria-label='播放进度' data-tv-player-control type='range' min='0' max={Math.max(1, time.duration || 1)} step='1' value={Math.min(time.current, time.duration || time.current)} onChange={(e) => seekTo(Number(e.target.value))} className='tv-focusable h-3 w-full cursor-pointer accent-rose-600' />
+          <input aria-label='播放进度' data-tv-no-focus='true' tabIndex={-1} type='range' min='0' max={Math.max(1, time.duration || 1)} step='1' value={Math.min(time.current, time.duration || time.current)} onChange={(e) => seekTo(Number(e.target.value))} className='h-3 w-full cursor-pointer accent-rose-600' />
           <div className='mt-2 flex items-center justify-between text-lg font-bold text-slate-200'>
             <span>{formatTVTime(time.current)}</span>
             <span>{time.duration ? `${Math.max(0, Math.round((time.current / time.duration) * 100))}%` : '0%'}</span>
@@ -705,6 +870,104 @@ function TVPlayClient() {
             {visibleEpisodeIndexes.map((index) => <button key={index} ref={(el) => { episodeButtonRefs.current[index] = el; }} onClick={() => switchEpisode(index)} data-tv-player-control className={`tv-focusable min-h-16 cursor-pointer rounded-2xl px-3 py-3 text-lg font-black outline-none focus:ring-4 focus:ring-rose-300 ${index === episodeIndex ? 'bg-rose-600' : 'bg-white/10'}`}>{detail.episodes_titles?.[index] || `第 ${index + 1} 集`}</button>)}
           </div>
         </aside>
+      )}
+      {showDanmakuSettings && (
+        <div className='absolute inset-0 z-40 flex items-center justify-center bg-black/60 p-10 backdrop-blur-sm'>
+          <section
+            data-tv-player-control
+            data-tv-focus-scope='active'
+            data-tv-danmaku-settings
+            className='w-[720px] max-w-[92vw] rounded-[34px] border border-white/10 bg-slate-950/95 p-7 text-white shadow-2xl shadow-black/80'
+            onKeyDownCapture={(event) => {
+              const target = event.target;
+              if (!(target instanceof HTMLElement) || !target.closest('[data-tv-danmaku-settings]')) return;
+
+              if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+                if (target instanceof HTMLInputElement && target.type === 'range') {
+                  const field = getDanmakuSettingField(target);
+                  if (!field) return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  updateTVDanmakuSetting(field, event.key === 'ArrowRight' ? 1 : -1, setDanmakuSettings);
+                  revealPanel();
+                }
+                return;
+              }
+
+              if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+                event.preventDefault();
+                event.stopPropagation();
+                moveFocusWithinScope(event.currentTarget as HTMLElement, event.key === 'ArrowDown' ? 'down' : 'up');
+                revealPanel();
+              }
+            }}
+          >
+            <div className='mb-7 flex items-center justify-between gap-5'>
+              <h2 className='flex items-center gap-3 text-3xl font-black'><SlidersHorizontal className='h-8 w-8 text-rose-500' />弹幕设置</h2>
+              <button onClick={() => { setShowDanmakuSettings(false); blurTVPlayerControl(); }} data-tv-player-control className='tv-focusable flex shrink-0 cursor-pointer items-center gap-2 whitespace-nowrap rounded-2xl bg-white/10 px-5 py-4 text-2xl font-black outline-none focus:ring-4 focus:ring-rose-300'><X className='h-7 w-7' />关闭</button>
+            </div>
+
+            <div className='space-y-7'>
+              <label className='block'>
+                <div className='mb-3 flex items-center justify-between text-xl font-bold'>
+                  <span>字号</span>
+                  <span className='text-rose-200'>{danmakuSettings.fontSize}px</span>
+                </div>
+                <input
+                  ref={danmakuFontSizeInputRef}
+                  aria-label='弹幕字号'
+                  data-tv-danmaku-field='fontSize'
+                  data-tv-player-control
+                  type='range'
+                  min='20'
+                  max='46'
+                  step='1'
+                  value={danmakuSettings.fontSize}
+                  onChange={(event) => setDanmakuSettings((prev) => ({ ...prev, fontSize: Number(event.target.value) }))}
+                  className='tv-focusable h-3 w-full cursor-pointer accent-rose-600 outline-none'
+                />
+              </label>
+
+              <label className='block'>
+                <div className='mb-3 flex items-center justify-between text-xl font-bold'>
+                  <span>显示区域</span>
+                  <span className='text-rose-200'>{danmakuSettings.displayArea}%</span>
+                </div>
+                <input
+                  aria-label='弹幕显示区域'
+                  data-tv-danmaku-field='displayArea'
+                  data-tv-player-control
+                  type='range'
+                  min='24'
+                  max='72'
+                  step='2'
+                  value={danmakuSettings.displayArea}
+                  onChange={(event) => setDanmakuSettings((prev) => ({ ...prev, displayArea: Number(event.target.value) }))}
+                  className='tv-focusable h-3 w-full cursor-pointer accent-rose-600 outline-none'
+                />
+              </label>
+
+              <label className='block'>
+                <div className='mb-3 flex items-center justify-between text-xl font-bold'>
+                  <span>不透明度</span>
+                  <span className='text-rose-200'>{Math.round(danmakuSettings.opacity * 100)}%</span>
+                </div>
+                <input
+                  aria-label='弹幕不透明度'
+                  data-tv-danmaku-field='opacity'
+                  data-tv-player-control
+                  type='range'
+                  min='25'
+                  max='100'
+                  step='5'
+                  value={Math.round(danmakuSettings.opacity * 100)}
+                  onChange={(event) => setDanmakuSettings((prev) => ({ ...prev, opacity: Number(event.target.value) / 100 }))}
+                  className='tv-focusable h-3 w-full cursor-pointer accent-rose-600 outline-none'
+                />
+              </label>
+            </div>
+          </section>
+        </div>
       )}
       {showDetail && (
         <div className='absolute inset-0 z-40 flex items-center justify-center bg-black/72 p-10 backdrop-blur-sm'>
